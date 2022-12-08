@@ -27,6 +27,8 @@ $> ./bin/server \
 	-spatial-database-uri 'pmtiles://?tiles=s3blob%3A%2F%2Ftiles%3Fregion%3Dus-east-1%26prefix%3Dpip%2F%26credentials%3Dsession&database=whosonfirst'
 ```
 
+The value of the `?tiles=` parameter should be a valid `gocloud.dev/blob.Bucket` URI. By default the `file://`, `s3://` and `s3blob://` schemes are supported. The `s3blob://` scheme is distinguished from the `s3://` scheme but its ability to define access credentials as a query parameter; consult the [aaronland/gocloud-blob-s3](https://github.com/aaronland/gocloud-blob-s3#credentials) documentation for details. The need to URL encode the value of the `?tiles=` parameter is an unfortunate by-product of the way the underlying `go-whosonfirst-spatial` code is currently implemented.
+
 And then in [whosonfirst/go-whosonfirst-spatial-grpc](https://github.com/whosonfirst/go-whosonfirst-spatial-grpc):
 
 ```
