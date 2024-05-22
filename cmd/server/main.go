@@ -1,13 +1,11 @@
 package main
 
 import (
-	_ "github.com/whosonfirst/go-whosonfirst-spatial-pmtiles"
-)
-
-import (
 	"context"
-	"github.com/whosonfirst/go-whosonfirst-spatial-grpc/app/server"
 	"log"
+
+	"github.com/whosonfirst/go-whosonfirst-spatial-grpc/app/server"
+	_ "github.com/whosonfirst/go-whosonfirst-spatial-pmtiles"
 )
 
 func main() {

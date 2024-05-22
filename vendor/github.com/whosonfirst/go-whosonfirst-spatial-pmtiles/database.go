@@ -4,7 +4,7 @@ import ()
 
 import (
 	_ "github.com/aaronland/gocloud-blob-s3"
-	_ "github.com/whosonfirst/go-whosonfirst-spatial-sqlite"
+	_ "github.com/whosonfirst/go-whosonfirst-spatial-sqlite"	
 	_ "gocloud.dev/blob/fileblob"
 	_ "gocloud.dev/docstore/awsdynamodb"
 	_ "gocloud.dev/docstore/memdocstore"
@@ -14,6 +14,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	aa_docstore "github.com/aaronland/gocloud-docstore"
 	"github.com/jtacoma/uritemplates"
 	"github.com/paulmach/orb"
@@ -30,12 +39,6 @@ import (
 	"github.com/whosonfirst/go-whosonfirst-spr/v2"
 	"github.com/whosonfirst/go-whosonfirst-uri"
 	"gocloud.dev/docstore"
-	"io"
-	"log"
-	"net/url"
-	"strconv"
-	"strings"
-	"sync"
 )
 
 func init() {
@@ -46,13 +49,17 @@ func init() {
 
 type PMTilesSpatialDatabase struct {
 	database.SpatialDatabase
-	loop                 *pmtiles.Loop
-	logger               *log.Logger
-	database             string
-	layer                string
-	enable_feature_cache bool
-	cache_manager        *CacheManager
-	zoom                 int
+	server                      *pmtiles.Server
+	database                    string
+	layer                       string
+	enable_feature_cache        bool
+	cache_manager               *CacheManager
+	zoom                        int
+	spatial_database_uri        string
+	spatial_databases_counter   *sync.Map
+	spatial_databases_increment int32
+	spatial_databases_cache     *sync.Map
+	spatial_databases_mutex     *sync.RWMutex
 }
 
 func NewPMTilesSpatialDatabaseReader(ctx context.Context, uri string) (reader.Reader, error) {
@@ -76,8 +83,6 @@ func NewPMTilesSpatialDatabase(ctx context.Context, uri string) (database.Spatia
 	if q_layer == "" {
 		q_layer = q_database
 	}
-
-	logger := log.Default()
 
 	cache_size := 64
 	zoom := 12
@@ -108,20 +113,38 @@ func NewPMTilesSpatialDatabase(ctx context.Context, uri string) (database.Spatia
 		zoom = z
 	}
 
-	loop, err := pmtiles.NewLoop(q_tile_path, logger, cache_size, "")
+	logger := slog.Default()
+	log_logger := slog.NewLogLogger(logger.Handler(), slog.LevelInfo)
+
+	server, err := pmtiles.NewServer(q_tile_path, "", log_logger, cache_size, "", "")
 
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create pmtiles.Loop, %w", err)
 	}
 
-	loop.Start()
+	server.Start()
+
+	spatial_databases_counter := new(sync.Map)
+	spatial_databases_increment := int32(0)
+	spatial_databases_cache := new(sync.Map)
+	spatial_databases_mutex := new(sync.RWMutex)
+
+	// To do: Check for query value
+
+	// This triggers "distance errors" which I don't really understand yet
+	// spatial_database_uri := "rtree://"
+	spatial_database_uri := "sqlite://?dsn=modernc://mem"
 
 	db := &PMTilesSpatialDatabase{
-		loop:     loop,
-		database: q_database,
-		layer:    q_layer,
-		logger:   logger,
-		zoom:     zoom,
+		server:                      server,
+		database:                    q_database,
+		layer:                       q_layer,
+		zoom:                        zoom,
+		spatial_database_uri:        spatial_database_uri,
+		spatial_databases_counter:   spatial_databases_counter,
+		spatial_databases_increment: spatial_databases_increment,
+		spatial_databases_cache:     spatial_databases_cache,
+		spatial_databases_mutex:     spatial_databases_mutex,
 	}
 
 	enable_feature_cache := false
@@ -142,7 +165,7 @@ func NewPMTilesSpatialDatabase(ctx context.Context, uri string) (database.Spatia
 
 	if enable_feature_cache {
 
-		cache_ttl := 300
+		cache_ttl := 3600
 
 		q_cache_ttl := q.Get("cache-ttl")
 
@@ -183,7 +206,6 @@ func NewPMTilesSpatialDatabase(ctx context.Context, uri string) (database.Spatia
 
 		cache_manager_opts := &CacheManagerOptions{
 			FeatureCollection: feature_cache,
-			Logger:            logger,
 			CacheTTL:          cache_ttl,
 		}
 
@@ -231,9 +253,61 @@ func (db *PMTilesSpatialDatabase) PointInPolygon(ctx context.Context, coord *orb
 		return nil, fmt.Errorf("Failed to create spatial database, %w", err)
 	}
 
-	defer spatial_db.Disconnect(ctx)
+	defer db.releaseSpatialDatabase(ctx, coord)
 
 	return spatial_db.PointInPolygon(ctx, coord, filters...)
+}
+
+func (db *PMTilesSpatialDatabase) releaseSpatialDatabase(ctx context.Context, coord *orb.Point) {
+
+	db.spatial_databases_mutex.Lock()
+	defer db.spatial_databases_mutex.Unlock()
+
+	db_name := db.spatialDatabaseNameFromCoord(ctx, coord)
+
+	new_increment := atomic.AddInt32(&db.spatial_databases_increment, 1)
+	db.spatial_databases_counter.Store(db_name, new_increment)
+
+	go func(test_increment int32) {
+
+		ttl := 10
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(ttl) * time.Second):
+
+			db.spatial_databases_mutex.Lock()
+			defer db.spatial_databases_mutex.Unlock()
+
+			db_name := db.spatialDatabaseNameFromCoord(ctx, coord)
+			current_increment := int32(0)
+
+			v, exists := db.spatial_databases_counter.Load(db_name)
+
+			if exists {
+				current_increment = v.(int32)
+			}
+
+			if current_increment >= test_increment {
+				return
+			}
+
+			db_v, exists := db.spatial_databases_cache.Load(db_name)
+
+			if !exists {
+				return
+			}
+
+			spatial_db := db_v.(database.SpatialDatabase)
+			spatial_db.Disconnect(ctx)
+			db.spatial_databases_cache.Delete(db_name)
+
+			return
+		}
+
+	}(new_increment)
+
 }
 
 func (db *PMTilesSpatialDatabase) PointInPolygonCandidates(ctx context.Context, coord *orb.Point, filters ...spatial.Filter) ([]*spatial.PointInPolygonCandidate, error) {
@@ -244,8 +318,8 @@ func (db *PMTilesSpatialDatabase) PointInPolygonCandidates(ctx context.Context, 
 		return nil, fmt.Errorf("Failed to create spatial database, %w", err)
 	}
 
-	defer spatial_db.Disconnect(ctx)
-
+	defer db.releaseSpatialDatabase(ctx, coord)
+	
 	return spatial_db.PointInPolygonCandidates(ctx, coord, filters...)
 }
 
@@ -258,7 +332,7 @@ func (db *PMTilesSpatialDatabase) PointInPolygonWithChannels(ctx context.Context
 		return
 	}
 
-	defer spatial_db.Disconnect(ctx)
+	defer db.releaseSpatialDatabase(ctx, coord)
 
 	spatial_db.PointInPolygonWithChannels(ctx, spr_ch, err_ch, done_ch, coord, filters...)
 }
@@ -272,12 +346,19 @@ func (db *PMTilesSpatialDatabase) PointInPolygonCandidatesWithChannels(ctx conte
 		return
 	}
 
-	defer spatial_db.Disconnect(ctx)
+	defer db.releaseSpatialDatabase(ctx, coord)
 
 	spatial_db.PointInPolygonCandidatesWithChannels(ctx, pip_ch, err_ch, done_ch, coord, filters...)
 }
 
 func (db *PMTilesSpatialDatabase) Disconnect(ctx context.Context) error {
+
+	db.spatial_databases_cache.Range(func(k interface{}, v interface{}) bool {
+		spatial_db := v.(database.SpatialDatabase)
+		spatial_db.Disconnect(ctx)
+		db.spatial_databases_cache.Delete(k.(string))
+		return true
+	})
 
 	db.cache_manager.Close(ctx)
 	return nil
@@ -307,7 +388,7 @@ func (db *PMTilesSpatialDatabase) Read(ctx context.Context, path string) (io.Rea
 	fc, err := db.cache_manager.GetFeatureCache(ctx, fname)
 
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get feature cache for %s, %w", path, err)
+		return nil, fmt.Errorf("Failed to read feature from cache for %s, %w", path, err)
 	}
 
 	r := strings.NewReader(fc.Body)
@@ -329,20 +410,32 @@ func (db *PMTilesSpatialDatabase) spatialDatabaseFromTile(ctx context.Context, t
 
 	path := fmt.Sprintf("/%s/%d/%d/%d.mvt", db.database, t.Z, t.X, t.Y)
 
-	db.logger.Printf("GET tile at %s", path)
+	logger := slog.Default()
+	logger = logger.With("path", path)
+
+	t1 := time.Now()
+
+	defer func() {
+		logger.Info("Time to create database", "time", time.Since(t1))
+	}()
+
+	logger.Debug("Get spatial database for tile")
 
 	features, err := db.featuresForTile(ctx, t)
 
 	if err != nil {
+		logger.Error("Failed to derive features for tile", "error", err)
 		return nil, fmt.Errorf("Failed to derive features for tile %s, %w", path, err)
 	}
 
-	spatial_db_uri := "sqlite://?dsn=modernc://mem"
+	logger = logger.With("spatial database uri", db.spatial_database_uri)
+	logger = logger.With("count features", len(features))
 
-	spatial_db, err := database.NewSpatialDatabase(ctx, spatial_db_uri)
+	spatial_db, err := database.NewSpatialDatabase(ctx, db.spatial_database_uri)
 
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create spatial database for '%s', %w", spatial_db_uri, err)
+		logger.Error("Failed to instantiate spatial database", "error", err)
+		return nil, fmt.Errorf("Failed to create spatial database for '%s', %w", db.spatial_database_uri, err)
 	}
 
 	seen := make(map[string]bool)
@@ -374,6 +467,7 @@ func (db *PMTilesSpatialDatabase) spatialDatabaseFromTile(ctx context.Context, t
 		id := id_rsp.Int()
 
 		if err != nil {
+			logger.Error("Failed to marshal JSON for feature", "id", id, "index", idx, "error", err)
 			return nil, fmt.Errorf("Failed to marshal JSON for feature %d at offset %d, %w", id, idx, err)
 		}
 
@@ -394,6 +488,7 @@ func (db *PMTilesSpatialDatabase) spatialDatabaseFromTile(ctx context.Context, t
 		body, err = db.decodeMVT(ctx, body)
 
 		if err != nil {
+			logger.Error("Failed to unfurl MVT for feature", "id", id, "index", idx, "error", err)
 			return nil, fmt.Errorf("Failed to unfurl MVT for feature %d at offset %d, %w", id, idx, err)
 		}
 
@@ -410,7 +505,7 @@ func (db *PMTilesSpatialDatabase) spatialDatabaseFromTile(ctx context.Context, t
 				_, err := db.cache_manager.CacheFeature(ctx, body)
 
 				if err != nil {
-					db.logger.Printf("Failed to create new feature cache for %s, %v", path, err)
+					logger.Warn("Failed to create new feature cache", "path", path, "error", err)
 				}
 
 			}(body)
@@ -419,6 +514,7 @@ func (db *PMTilesSpatialDatabase) spatialDatabaseFromTile(ctx context.Context, t
 		err = spatial_db.IndexFeature(ctx, body)
 
 		if err != nil {
+			logger.Error("Failed to index feature", "id", id, "index", idx, "error", err)
 			return nil, fmt.Errorf("Failed to index feature %d at offset %d, %w", id, idx, err)
 		}
 	}
@@ -428,14 +524,40 @@ func (db *PMTilesSpatialDatabase) spatialDatabaseFromTile(ctx context.Context, t
 	return spatial_db, nil
 }
 
-func (db *PMTilesSpatialDatabase) spatialDatabaseFromCoord(ctx context.Context, coord *orb.Point) (database.SpatialDatabase, error) {
+func (db *PMTilesSpatialDatabase) spatialDatabaseNameFromCoord(ctx context.Context, coord *orb.Point) string {
 
 	zoom := uint32(db.zoom)
-
 	z := maptile.Zoom(zoom)
 	t := maptile.At(*coord, z)
 
-	return db.spatialDatabaseFromTile(ctx, t)
+	return fmt.Sprintf("%s-%d-%d-%d.db", db.database, t.Z, t.X, t.Y)
+}
+
+func (db *PMTilesSpatialDatabase) spatialDatabaseFromCoord(ctx context.Context, coord *orb.Point) (database.SpatialDatabase, error) {
+
+	db.spatial_databases_mutex.Lock()
+	defer db.spatial_databases_mutex.Unlock()
+
+	db_name := db.spatialDatabaseNameFromCoord(ctx, coord)
+
+	v, exists := db.spatial_databases_cache.Load(db_name)
+
+	if exists {
+		return v.(database.SpatialDatabase), nil
+	}
+
+	zoom := uint32(db.zoom)
+	z := maptile.Zoom(zoom)
+	t := maptile.At(*coord, z)
+
+	spatial_db, err := db.spatialDatabaseFromTile(ctx, t)
+
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create spatial database, %w", err)
+	}
+
+	db.spatial_databases_cache.Store(db_name, spatial_db)
+	return spatial_db, nil
 }
 
 func (db *PMTilesSpatialDatabase) featuresForTile(ctx context.Context, t maptile.Tile) ([]*geojson.Feature, error) {
@@ -447,20 +569,13 @@ func (db *PMTilesSpatialDatabase) featuresForTile(ctx context.Context, t maptile
 	// So, in an AWS context, we could write tile caches to a gocloud.dev/blob instance but
 	// will that read really be faster than reading from the PMTiles database also in S3? Maybe?
 
-	status_code, _, body := db.loop.Get(ctx, path)
-
-	if status_code != 200 {
-		return nil, fmt.Errorf("Failed to get %s, unexpected status code %d", path, status_code)
-	}
-
-	// not sure what the semantics are here but it's not treated as an error in protomaps
-	// https://github.com/protomaps/go-pmtiles/blob/0ac8f97530b3367142cfd250585d60936d0ce643/pmtiles/loop.go#L296
+	status_code, _, body := db.server.Get(ctx, path)
 
 	var features []*geojson.Feature
 
-	if status_code == 204 {
-		features = make([]*geojson.Feature, 0)
-	} else {
+	switch status_code {
+
+	case 200:
 
 		layers, err := mvt.UnmarshalGzipped(body)
 
@@ -481,6 +596,15 @@ func (db *PMTilesSpatialDatabase) featuresForTile(ctx context.Context, t maptile
 		}
 
 		features = fc[db.layer].Features
+
+	case 204:
+
+		// not sure what the semantics are here but 204 is not treated as an error in protomaps
+		// https://github.com/protomaps/go-pmtiles/blob/0ac8f97530b3367142cfd250585d60936d0ce643/pmtiles/loop.go#L296
+
+		features = make([]*geojson.Feature, 0)
+	default:
+		return nil, fmt.Errorf("Failed to get %s, unexpected status code %d", path, status_code)
 	}
 
 	return features, nil
@@ -506,7 +630,7 @@ func (db *PMTilesSpatialDatabase) decodeMVT(ctx context.Context, body []byte) ([
 			err := json.Unmarshal([]byte(v.String()), &values)
 
 			if err != nil {
-				return nil, fmt.Errorf("Failed to unmarshal %k value (%s), %w", k, v.String(), err)
+				return nil, fmt.Errorf("Failed to unmarshal %s value (%s), %w", k, v.String(), err)
 			}
 
 			path := fmt.Sprintf("properties.%s", k)
@@ -523,7 +647,7 @@ func (db *PMTilesSpatialDatabase) decodeMVT(ctx context.Context, body []byte) ([
 			err := json.Unmarshal([]byte(v.String()), &values)
 
 			if err != nil {
-				return nil, fmt.Errorf("Failed to unmarshal %k value (%s), %w", k, v.String(), err)
+				return nil, fmt.Errorf("Failed to unmarshal %s value (%s), %w", k, v.String(), err)
 			}
 
 			path := fmt.Sprintf("properties.%s", k)

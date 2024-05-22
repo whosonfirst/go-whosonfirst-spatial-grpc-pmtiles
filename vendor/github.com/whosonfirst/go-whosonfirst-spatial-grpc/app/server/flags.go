@@ -3,29 +3,60 @@ package server
 import (
 	"flag"
 	"fmt"
-	grpc_flags "github.com/whosonfirst/go-whosonfirst-spatial-grpc/flags"
-	spatial_flags "github.com/whosonfirst/go-whosonfirst-spatial/flags"
+	"sort"
+	"strings"
+
+	"github.com/sfomuseum/go-flags/flagset"
+	"github.com/whosonfirst/go-reader"
+	"github.com/whosonfirst/go-whosonfirst-iterate/v2/emitter"
+	"github.com/whosonfirst/go-whosonfirst-spatial/database"
 )
+
+var host string
+var port int
+
+var spatial_database_uri string
+var properties_reader_uri string
+
+var is_wof bool
+
+var enable_custom_placetypes bool
+var custom_placetypes string
+
+var iterator_uri string
 
 func DefaultFlagSet() (*flag.FlagSet, error) {
 
-	fs, err := spatial_flags.CommonFlags()
+	fs := flagset.NewFlagSet("server")
 
-	if err != nil {
-		return nil, fmt.Errorf("Failed to create common flags, %v", err)
-	}
+	fs.StringVar(&host, "host", "localhost", "...")
+	fs.IntVar(&port, "port", 8082, "...")
 
-	err = spatial_flags.AppendIndexingFlags(fs)
+	available_databases := database.Schemes()
+	desc_databases := fmt.Sprintf("A valid whosonfirst/go-whosonfirst-spatial/data.SpatialDatabase URI. options are: %s", available_databases)
 
-	if err != nil {
-		return nil, fmt.Errorf("Failed to append indexing flags, %v", err)
-	}
+	fs.StringVar(&spatial_database_uri, "spatial-database-uri", "rtree://", desc_databases)
 
-	err = grpc_flags.AppendGRPCServerFlags(fs)
+	available_readers := reader.Schemes()
+	desc_readers := fmt.Sprintf("A valid whosonfirst/go-reader.Reader URI. Available options are: %s", available_readers)
 
-	if err != nil {
-		return nil, fmt.Errorf("Failed to append server flags, %v", err)
-	}
+	fs.StringVar(&properties_reader_uri, "properties-reader-uri", "", fmt.Sprintf("%s. If the value is {spatial-database-uri} then the value of the '-spatial-database-uri' implements the reader.Reader interface and will be used.", desc_readers))
+
+	fs.BoolVar(&is_wof, "is-wof", true, "Input data is WOF-flavoured GeoJSON. (Pass a value of '0' or 'false' if you need to index non-WOF documents.")
+
+	fs.BoolVar(&enable_custom_placetypes, "enable-custom-placetypes", false, "Enable wof:placetype values that are not explicitly defined in the whosonfirst/go-whosonfirst-placetypes repository.")
+
+	fs.StringVar(&custom_placetypes, "custom-placetypes", "", "A JSON-encoded string containing custom placetypes defined using the syntax described in the whosonfirst/go-whosonfirst-placetypes repository.")
+
+	// Indexing flags
+
+	modes := emitter.Schemes()
+	sort.Strings(modes)
+
+	valid_modes := strings.Join(modes, ", ")
+	desc_modes := fmt.Sprintf("A valid whosonfirst/go-whosonfirst-iterate/v2 URI. Supported schemes are: %s.", valid_modes)
+
+	fs.StringVar(&iterator_uri, "iterator-uri", "repo://", desc_modes)
 
 	return fs, nil
 }

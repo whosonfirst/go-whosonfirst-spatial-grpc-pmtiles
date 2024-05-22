@@ -4,16 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/sfomuseum/go-flags/flagset"
-	"github.com/sfomuseum/go-flags/lookup"
-	grpc_flags "github.com/whosonfirst/go-whosonfirst-spatial-grpc/flags"
-	grpc_server "github.com/whosonfirst/go-whosonfirst-spatial-grpc/server"
-	"github.com/whosonfirst/go-whosonfirst-spatial-grpc/spatial"
-	spatial_app "github.com/whosonfirst/go-whosonfirst-spatial/app"
-	spatial_flags "github.com/whosonfirst/go-whosonfirst-spatial/flags"
-	"google.golang.org/grpc"
 	"log"
 	"net"
+
+	grpc_server "github.com/whosonfirst/go-whosonfirst-spatial-grpc/server"
+	"github.com/whosonfirst/go-whosonfirst-spatial-grpc/spatial"
+	app "github.com/whosonfirst/go-whosonfirst-spatial/application"
+	"google.golang.org/grpc"
 )
 
 func Run(ctx context.Context, logger *log.Logger) error {
@@ -29,44 +26,42 @@ func Run(ctx context.Context, logger *log.Logger) error {
 
 func RunWithFlagSet(ctx context.Context, fs *flag.FlagSet, logger *log.Logger) error {
 
-	flagset.Parse(fs)
-
-	err := spatial_flags.ValidateCommonFlags(fs)
+	opts, err := RunOptionsFromFlagSet(ctx, fs)
 
 	if err != nil {
-		return fmt.Errorf("Failed to validate common flags, %v", err)
+		return fmt.Errorf("Failed to derive options from flagset, %w", err)
 	}
 
-	err = spatial_flags.ValidateIndexingFlags(fs)
+	return RunWithOptions(ctx, opts, logger)
+}
+
+func RunWithOptions(ctx context.Context, opts *RunOptions, logger *log.Logger) error {
+
+	spatial_opts := &app.SpatialApplicationOptions{
+		SpatialDatabaseURI:     opts.SpatialDatabaseURI,
+		PropertiesReaderURI:    opts.PropertiesReaderURI,
+		IteratorURI:            opts.IteratorURI,
+		EnableCustomPlacetypes: opts.EnableCustomPlacetypes,
+		CustomPlacetypes:       opts.CustomPlacetypes,
+		IsWhosOnFirst:          opts.IsWhosOnFirst,
+	}
+
+	spatial_app, err := app.NewSpatialApplication(ctx, spatial_opts)
 
 	if err != nil {
-		return fmt.Errorf("Failed to validate indexing flags, %v", err)
+		return fmt.Errorf("Failed to create new spatial application, %w", err)
 	}
 
-	err = grpc_flags.ValidateGRPCServerFlags(fs)
+	if len(opts.IteratorSources) > 0 {
 
-	if err != nil {
-		return fmt.Errorf("Failed to validate server flags, %v", err)
+		err = spatial_app.IndexPaths(ctx, opts.IteratorSources...)
+
+		if err != nil {
+			return fmt.Errorf("Failed to index paths, %v", err)
+		}
 	}
 
-	host, _ := lookup.StringVar(fs, grpc_flags.HOST)
-	port, _ := lookup.IntVar(fs, grpc_flags.PORT)
-
-	sp_app, err := spatial_app.NewSpatialApplicationWithFlagSet(ctx, fs)
-
-	if err != nil {
-		return fmt.Errorf("Failed to create new spatial application, %v", err)
-	}
-
-	uris := fs.Args()
-
-	err = sp_app.IndexPaths(ctx, uris...)
-
-	if err != nil {
-		return fmt.Errorf("Failed to index paths, %v", err)
-	}
-
-	spatial_server, err := grpc_server.NewSpatialServer(sp_app)
+	spatial_server, err := grpc_server.NewSpatialServer(spatial_app)
 
 	if err != nil {
 		return fmt.Errorf("Failed to create spatial server, %v", err)
@@ -76,7 +71,7 @@ func RunWithFlagSet(ctx context.Context, fs *flag.FlagSet, logger *log.Logger) e
 
 	spatial.RegisterSpatialServer(grpc_server, spatial_server)
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
 	log.Printf("Listening on %s\n", addr)
 
 	lis, err := net.Listen("tcp", addr)

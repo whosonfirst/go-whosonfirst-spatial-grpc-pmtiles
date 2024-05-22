@@ -3,11 +3,12 @@ package server
 import (
 	"context"
 	"fmt"
+
 	"github.com/whosonfirst/go-whosonfirst-flags"
 	"github.com/whosonfirst/go-whosonfirst-spatial-grpc/request"
 	"github.com/whosonfirst/go-whosonfirst-spatial-grpc/spatial"
-	"github.com/whosonfirst/go-whosonfirst-spatial-pip"
-	"github.com/whosonfirst/go-whosonfirst-spatial/app"
+	app "github.com/whosonfirst/go-whosonfirst-spatial/application"
+	"github.com/whosonfirst/go-whosonfirst-spatial/pip"
 	"github.com/whosonfirst/go-whosonfirst-spr/v2"
 )
 
