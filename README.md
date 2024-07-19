@@ -2,6 +2,11 @@
 
 Go package implementing the `go-whosonfirst-spatial-grpc` toolchain with support for Protomaps PMTiles databases.
 
+## Important
+
+This package has been deprecated. All its functionality has been moved in to [whosonfirst/go-whosonfirst-spatial-pmtiles](https://github.com/whosonfirst/go-whosonfirst-spatial-pmtiles).
+
+
 ## Documentation
 
 Documentation is incomplete at this time.
